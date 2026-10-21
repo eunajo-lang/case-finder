@@ -52,7 +52,12 @@ def _read_secret(name: str) -> str:
         )
         return response.payload.data.decode("utf-8").strip()
     except Exception as error:
-        raise ConfigurationError(f"Secret Manager에서 {name}을(를) 읽을 수 없습니다.") from error
+        # The exception type is enough to distinguish an IAM failure from a
+        # malformed deployment credential; never include the provider message,
+        # which can contain sensitive deployment context.
+        raise ConfigurationError(
+            f"Secret Manager에서 {name}을(를) 읽을 수 없습니다. ({type(error).__name__})"
+        ) from error
 
 
 def _value_or_secret(variable: str, *, required: bool = False) -> str | None:
