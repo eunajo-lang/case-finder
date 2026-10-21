@@ -269,8 +269,14 @@ class FirestoreConnectionStore:
         self.audit(slack_user_id=slack_user_id, action=action, provider=provider)
 
     def connected_providers(self, slack_user_id):
-        docs = self._db.collection(f"{self._prefix}_connections").where("slack_user_id", "==", slack_user_id).stream()
-        return {Provider(doc.to_dict()["provider"]) for doc in docs}
+        # Connection documents use a deterministic provider/user id.  Looking up
+        # those documents directly avoids relying on a Firestore query to decide
+        # whether a just-completed OAuth connection exists.
+        return {
+            provider
+            for provider in Provider
+            if self._raw_connection(provider, slack_user_id) is not None
+        }
 
     def save_oauth_state(self, *, digest, provider, slack_user_id, expires_at):
         self._doc("oauth_states", digest).create({"provider": provider.value, "slack_user_id": slack_user_id, "expires_at": expires_at})
