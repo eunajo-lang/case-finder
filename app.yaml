@@ -1,0 +1,17 @@
+runtime: python312
+entrypoint: uvicorn app.main:app_from_env --factory --host 0.0.0.0 --port $PORT --proxy-headers
+
+env_variables:
+  # Replaced with the generated App Engine URL immediately after the first deploy.
+  APP_BASE_URL: https://pending.invalid
+  STORAGE_BACKEND: firestore
+  FIRESTORE_COLLECTION_PREFIX: case_finder
+  GCP_PROJECT_ID: case-finder-test
+
+  # These are Secret Manager *names*, never secret values.
+  TOKEN_ENCRYPTION_KEY_SECRET: token-encryption-key
+  STATE_SIGNING_SECRET_SECRET: state-signing-secret
+  SLACK_SIGNING_SECRET_SECRET: slack-signing-secret
+  SLACK_BOT_TOKEN_SECRET: slack-bot-token
+  SLACK_CLIENT_ID_SECRET: slack-client-id
+  SLACK_CLIENT_SECRET_SECRET: slack-client-secret
