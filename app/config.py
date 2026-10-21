@@ -78,10 +78,13 @@ def _service_account_json() -> str | None:
     Render stores the base64 form as an encrypted environment variable.  The
     raw key is never committed, logged, or written to disk by this app.
     """
-    encoded = _optional("GOOGLE_SERVICE_ACCOUNT_JSON_B64")
-    if not encoded:
+    encoded_raw = _optional("GOOGLE_SERVICE_ACCOUNT_JSON_B64")
+    if not encoded_raw:
         return None
     try:
+        # Text areas may preserve visual line wrapping as whitespace. Whitespace
+        # is not meaningful in a Base64 value, so normalize it before checking.
+        encoded = "".join(encoded_raw.split())
         # Some deployment UIs trim trailing '=' padding. Restore only the
         # required padding; strict validation still rejects non-base64 data.
         padded = encoded + ("=" * (-len(encoded) % 4))
