@@ -38,8 +38,15 @@ def _read_secret(name: str) -> str:
         raise ConfigurationError(f"{name}_SECRET를 사용하려면 GCP_PROJECT_ID가 필요합니다.")
     try:
         from google.cloud import secretmanager
+        from google.oauth2 import service_account
 
-        client = secretmanager.SecretManagerServiceClient()
+        service_account_json = _service_account_json()
+        credentials = (
+            service_account.Credentials.from_service_account_info(json.loads(service_account_json))
+            if service_account_json
+            else None
+        )
+        client = secretmanager.SecretManagerServiceClient(credentials=credentials)
         response = client.access_secret_version(
             request={"name": f"projects/{project_id}/secrets/{name}/versions/latest"}
         )
