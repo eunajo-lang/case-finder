@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -10,6 +11,9 @@ from .config import Settings
 from .connectors import ConnectorError, GmailReader, JiraReader, SlackReader
 from .models import Provider, SourceRecord
 from .store import ConnectionStore
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -72,7 +76,11 @@ class AnswerService:
             return self._evidence_only(outcome)
         try:
             return await self._openai_answer(question=question, records=outcome.records, unavailable=outcome.unavailable)
-        except (httpx.HTTPError, ValueError, KeyError):
+        except httpx.HTTPStatusError as error:
+            logger.warning("OpenAI summary request failed with HTTP %s", error.response.status_code)
+            return self._evidence_only(outcome, provider_problem=True)
+        except (httpx.HTTPError, ValueError, KeyError) as error:
+            logger.warning("OpenAI summary request failed: %s", type(error).__name__)
             # Fail safely: provide only directly observed source labels, never a made-up conclusion.
             return self._evidence_only(outcome, provider_problem=True)
 
@@ -83,13 +91,22 @@ class AnswerService:
 
     @staticmethod
     def _evidence_only(outcome: SearchOutcome, provider_problem: bool = False) -> str:
-        lines = ["관련 후보를 찾았습니다. AI 요약은 아직 연결되지 않아, 아래 근거만 제공합니다."]
+        lines = ["*핵심 결론*", "관련 후보는 찾았지만, 근거만으로 처리 결과나 최종 결론을 단정할 수 없습니다."]
+        lines.extend(["", "*기록에서 마지막으로 확인된 상태*"])
+        newest = outcome.records[0]
+        newest_date = newest.occurred_at or "날짜 미확인"
+        lines.append(
+            f"가장 최근 후보는 {newest_date}의 [{newest.provider.value}] {newest.title}입니다. "
+            "이 기록이 최종 상태인지는 확인되지 않았습니다."
+        )
+        lines.extend(["", "*근거*"])
         if provider_problem:
-            lines.append("요약 서비스에 문제가 있어 사실 판단을 생성하지 않았습니다.")
+            lines.append("AI 요약 서비스를 사용할 수 없어, 아래 원문 후보만 제공합니다.")
         for index, item in enumerate(outcome.records[:8], 1):
             date = item.occurred_at or "날짜 미확인"
             link = f" <{item.source_url}|원문>" if item.source_url else " (원문 링크는 구현 검증 필요)"
             lines.append(f"{index}. [{item.provider.value}] {item.title} · {date}{link}")
+        lines.extend(["", "*확인 필요*", "서로 다른 사건 후보가 섞였을 수 있으므로, 처리 결과는 원문을 확인한 뒤 판단해야 합니다."])
         return "\n".join(lines)
 
     async def _openai_answer(
@@ -107,11 +124,21 @@ class AnswerService:
                     "url": item.source_url,
                 }
             )
-        instruction = """당신은 업무 기록을 요약하는 한국어 비서다. 제공된 근거만 사용한다.
-사실, 검토 의견, 결정, 실행 결과, 이후 변경을 구분한다. 근거가 부족하면 부족하다고 말한다.
-서로 다른 사건을 합치지 않는다. '없다'고 단정하지 않는다. 답은 짧게, 다음 순서를 지킨다:
-1) 핵심 결론, 2) 기록에서 마지막으로 확인된 상태와 날짜, 3) 근거 목록.
-각 주요 판단에는 [근거 N]을 붙인다. URL이 없는 근거에는 링크를 지어내지 않는다.
+        instruction = """당신은 업무 기록을 설명하는 한국어 비서다. 제공된 근거만 사용한다.
+추측, 일반 지식, 사용자 질문의 주장만으로 사실을 만들지 않는다. 서로 다른 사건을 합치지 않는다.
+
+답변은 짧고 반드시 아래 순서를 따른다.
+*핵심 결론*
+*기록에서 마지막으로 확인된 상태*
+*근거*
+*확인 필요* (근거 부족·충돌·여러 사건 후보가 있을 때만)
+
+규칙:
+- 사실, 검토 의견, 제안, 최종 결정, 실행 결과, 이후 변경을 구분한다.
+- 마지막 상태는 반드시 '기록에서 마지막으로 확인된 상태'라고 표현하며, 최신 메시지 하나만으로 최종 결정이라 단정하지 않는다.
+- 사건이 충분히 특정되지 않거나 후보가 서로 다르면 결론을 내리지 말고 시기·증상·처리 결과 중 무엇을 알려주면 구분할 수 있는지 한 가지 질문을 한다.
+- 각 주요 판단에 [근거 N]을 붙이고, 근거 목록에는 해당 번호와 제공된 URL만 쓴다. URL·날짜·처리 결과를 지어내지 않는다.
+- 기록을 찾지 못해도 '없었다'고 단정하지 않는다.
 """
         payload = {
             "model": self.settings.openai_model,
