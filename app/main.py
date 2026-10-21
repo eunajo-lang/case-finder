@@ -96,7 +96,11 @@ async def handle_question(
         message = _connection_message(settings, store, signer, oauth, slack_user_id, list(Provider))
     else:
         try:
-            outcome = await search.search(slack_user_id=slack_user_id, question=text)
+            outcome = await search.search(
+                slack_user_id=slack_user_id,
+                question=text,
+                exclude_slack_conversation_id=channel_id,
+            )
             message = await answer.compose(question=text, outcome=outcome)
         except Exception:
             # Do not include provider error text: it might expose source or configuration details.

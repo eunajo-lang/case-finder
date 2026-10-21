@@ -1,12 +1,146 @@
 from __future__ import annotations
 
 import base64
+import re
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
 from .models import Provider, SlackConversation, SourceRecord, may_use_slack_conversation
+
+
+_QUERY_FILLER_WORDS = {
+    "관련",
+    "이슈",
+    "어떻게",
+    "알려줘",
+    "알려",
+    "주세요",
+    "부탁",
+    "민원",
+    "문의",
+    "확인",
+    "정상",
+    "이용",
+    "경우",
+    "이런",
+    "이러한",
+    "무엇",
+    "무슨",
+    "왜",
+    "아직",
+    "그런",
+    "대한",
+}
+_KOREAN_ENDINGS = (
+    "했는데",
+    "하는데",
+    "되는데",
+    "됐는데",
+    "합니다",
+    "했습니다",
+    "해주세요",
+    "되나요",
+    "인가요",
+    "입니다",
+    "이었어요",
+    "었어요",
+    "아요",
+    "어요",
+    "으로",
+    "에서",
+    "에게",
+    "에는",
+    "으로",
+    "이고",
+    "이며",
+    "이",
+    "가",
+    "은",
+    "는",
+    "을",
+    "를",
+    "에",
+)
+_INCIDENT_TERMS = ("신청", "등록", "조회", "미납", "주소", "오류", "고지서", "카드", "해지", "동기화")
+_SUBJECT_TERMS = (
+    "전기요금",
+    "도시가스",
+    "가스앱",
+    "전기",
+    "가스",
+    "요금",
+    "결제",
+    "청구",
+    "계약",
+    "계정",
+    "서비스",
+)
+_INCIDENT_EXPANSIONS = {
+    "신청": ("신청", "등록", "조회"),
+    "등록": ("등록", "신청", "조회"),
+    "조회": ("조회", "등록", "신청"),
+    "미납": ("미납", "고지서", "납부"),
+    "고지서": ("고지서", "미납", "납부"),
+    "주소": ("주소", "정보", "정정"),
+    "오류": ("오류", "등록", "조회"),
+    "카드": ("카드", "계약", "조회"),
+    "해지": ("해지", "재신청", "등록"),
+    "동기화": ("동기화", "등록", "조회"),
+}
+
+
+def slack_query_variants(question: str, maximum: int = 4) -> list[str]:
+    """Create a small, deterministic set of Slack full-text queries.
+
+    Slack's search API is lexical. Passing an entire natural-language complaint
+    makes every word mandatory and often hides useful historical cases, so use
+    a subject anchor and a few symptom variants instead. This is deliberately
+    bounded to limit data retrieval and API calls.
+    """
+    normalized = re.sub(r"[^0-9A-Za-z가-힣]+", " ", question).strip()
+    tokens: list[str] = []
+    for raw in re.findall(r"[0-9A-Za-z가-힣]{2,}", normalized):
+        token = raw.lower()
+        for ending in _KOREAN_ENDINGS:
+            if token.endswith(ending) and len(token) - len(ending) >= 2:
+                token = token[: -len(ending)]
+                break
+        if token and token not in _QUERY_FILLER_WORDS and token not in tokens:
+            tokens.append(token)
+
+    if not tokens:
+        return []
+
+    # Prefer an identifiable business object over an adjective such as "정상적".
+    anchor = next((term for term in _SUBJECT_TERMS if term in normalized), max(tokens, key=len))
+    variants = [anchor]
+    incident_terms: list[str] = []
+    for marker, expansions in _INCIDENT_EXPANSIONS.items():
+        if marker in normalized:
+            incident_terms.extend(expansions)
+    incident_terms.extend(term for term in _INCIDENT_TERMS if term in normalized)
+    if not incident_terms:
+        incident_terms.extend(token for token in tokens if token != anchor)
+    for term in incident_terms:
+        if term != anchor:
+            variants.append(f"{anchor} {term}")
+
+    unique: list[str] = []
+    for query in variants:
+        if query not in unique:
+            unique.append(query)
+        if len(unique) >= max(1, min(maximum, 4)):
+            break
+    return unique
+
+
+def _slack_timestamp_number(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class ConnectorError(RuntimeError):
@@ -47,18 +181,82 @@ class SlackReader:
                 is_mpim=bool(channel.get("is_mpim")),
                 member_ids=frozenset(members.get("members", [])),
             )
-        except ConnectorError:
+        except (ConnectorError, httpx.HTTPError):
             # A source that cannot be re-checked is excluded rather than surfaced.
             return None
 
-    async def search(self, query: str, limit: int = 20) -> list[SourceRecord]:
-        result = await self._api("search.messages", query=query, count=min(limit, 20), sort="timestamp")
+    async def search_cases(
+        self,
+        question: str,
+        *,
+        limit: int = 4,
+        exclude_conversation_id: str | None = None,
+    ) -> list[SourceRecord]:
+        """Return Slack evidence grouped by incident thread, never by individual hit.
+
+        All visibility checks happen before a thread is read.  A public channel
+        is eligible even if the requester is not a member; a private
+        channel/DM/MPDM is eligible only while the requester is a member.
+        """
+        queries = slack_query_variants(question)
+        if not queries:
+            return []
+
+        candidates: dict[tuple[str, str], dict[str, Any]] = {}
+        for query in queries:
+            result = await self._api(
+                "search.messages",
+                query=query,
+                count=min(max(limit * 3, 12), 20),
+                # Slack's default relevance ordering is intentionally used here;
+                # timestamp ordering was surfacing recent but unrelated deploy logs.
+                sort="score",
+            )
+            for match in result.get("messages", {}).get("matches", []):
+                conversation_id = match.get("channel", {}).get("id")
+                timestamp = match.get("ts")
+                if not conversation_id or not timestamp or conversation_id == exclude_conversation_id:
+                    continue
+                root_ts = match.get("thread_ts") or timestamp
+                key = (conversation_id, root_ts)
+                candidate = candidates.setdefault(
+                    key,
+                    {
+                        "conversation_id": conversation_id,
+                        "root_ts": root_ts,
+                        "channel_name": match.get("channel", {}).get("name") or "Slack 대화",
+                        "matched_queries": set(),
+                        "matched_timestamps": set(),
+                        "search_may_be_incomplete": False,
+                    },
+                )
+                candidate["matched_queries"].add(query)
+                candidate["matched_timestamps"].add(timestamp)
+                messages = result.get("messages", {})
+                paging = messages.get("paging", {})
+                candidate["search_may_be_incomplete"] = candidate["search_may_be_incomplete"] or bool(
+                    result.get("response_metadata", {}).get("next_cursor")
+                    or paging.get("page", 1) < paging.get("pages", 1)
+                )
+
+        def priority(candidate: dict[str, Any]) -> tuple[int, int, float]:
+            return (
+                len(candidate["matched_queries"]),
+                len(candidate["matched_timestamps"]),
+                _slack_timestamp_number(candidate["root_ts"]),
+            )
+
         records: list[SourceRecord] = []
         checked: dict[str, SlackConversation | None] = {}
-        for match in result.get("messages", {}).get("matches", []):
-            conversation_id = match.get("channel", {}).get("id")
-            if not conversation_id:
-                continue
+        # First deduplicate raw search hits. Only then re-check a small number
+        # of candidate conversations and read up to `limit` whole threads.
+        # This avoids a conversations.info request for every lexical hit.
+        candidate_review_limit = max(4, min(max(limit * 2, 4), 8))
+        for candidate in sorted(candidates.values(), key=priority, reverse=True)[:candidate_review_limit]:
+            if len(records) >= limit:
+                break
+            conversation_id = candidate["conversation_id"]
+            root_ts = candidate["root_ts"]
             if conversation_id not in checked:
                 checked[conversation_id] = await self._conversation(conversation_id)
             conversation = checked[conversation_id]
@@ -66,27 +264,66 @@ class SlackReader:
                 requester_id=self._requester_id, conversation=conversation
             ):
                 continue
-            timestamp = match.get("ts")
-            permalink = None
-            if timestamp:
-                try:
-                    permalink = (await self._api("chat.getPermalink", channel=conversation_id, message_ts=timestamp)).get(
-                        "permalink"
-                    )
-                except ConnectorError:
-                    pass
+            try:
+                reply_payload = await self._api(
+                    "conversations.replies", channel=conversation_id, ts=root_ts, limit=15
+                )
+            except (ConnectorError, httpx.HTTPError):
+                # Do not surface a case if the complete incident cannot be read.
+                continue
+            messages: list[dict[str, str]] = []
+            for message in reply_payload.get("messages", []):
+                text = message.get("text")
+                timestamp = message.get("ts")
+                if not isinstance(text, str) or not timestamp:
+                    continue
+                messages.append({"ts": str(timestamp), "text": text[:3000]})
+            if not messages:
+                continue
+            messages.sort(key=lambda item: _slack_timestamp_number(item["ts"]))
+            latest_ts = messages[-1]["ts"]
+            next_cursor = reply_payload.get("response_metadata", {}).get("next_cursor")
+            thread_may_be_truncated = bool(next_cursor) or len(messages) >= 15
+            try:
+                permalink = (
+                    await self._api("chat.getPermalink", channel=conversation_id, message_ts=root_ts)
+                ).get("permalink")
+            except (ConnectorError, httpx.HTTPError):
+                permalink = None
+            thread_text = "\n".join(item["text"] for item in messages)[:12000]
             records.append(
                 SourceRecord(
                     provider=Provider.SLACK,
-                    source_id=f"{conversation_id}:{timestamp or ''}",
-                    title=match.get("channel", {}).get("name") or "Slack 대화",
-                    occurred_at=match.get("ts"),
-                    excerpt=match.get("text", "")[:4000],
+                    source_id=f"{conversation_id}:{root_ts}",
+                    title=candidate["channel_name"],
+                    occurred_at=root_ts,
+                    excerpt=thread_text,
                     source_url=permalink,
-                    metadata={"conversation_id": conversation_id, "thread_ts": match.get("thread_ts")},
+                    metadata={
+                        "case_kind": "slack_thread",
+                        "conversation_id": conversation_id,
+                        "thread_ts": root_ts,
+                        "latest_message_ts": latest_ts,
+                        "thread_messages": messages,
+                        "matched_queries": sorted(candidate["matched_queries"]),
+                        "retrieval_score": priority(candidate)[:2],
+                        "thread_may_be_truncated": thread_may_be_truncated,
+                        "search_may_be_incomplete": candidate["search_may_be_incomplete"],
+                    },
                 )
             )
+        records.sort(
+            key=lambda item: (
+                tuple(item.metadata.get("retrieval_score", (0, 0))),
+                _slack_timestamp_number(item.metadata.get("latest_message_ts", item.occurred_at)),
+            ),
+            reverse=True,
+        )
         return records
+
+    async def search(self, query: str, limit: int = 20) -> list[SourceRecord]:
+        """Compatibility wrapper for callers that need Slack search evidence."""
+        return await self.search_cases(query, limit=min(limit, 4))
 
 
 class JiraReader:
