@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 from dataclasses import dataclass
 from functools import lru_cache
@@ -59,6 +60,25 @@ def _value_or_secret(variable: str, *, required: bool = False) -> str | None:
     return None
 
 
+def _service_account_json() -> str | None:
+    """Decode an optional Render-only GCP service-account credential.
+
+    Render stores the base64 form as an encrypted environment variable.  The
+    raw key is never committed, logged, or written to disk by this app.
+    """
+    encoded = _optional("GOOGLE_SERVICE_ACCOUNT_JSON_B64")
+    if not encoded:
+        return None
+    try:
+        decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+        parsed = json.loads(decoded)
+        if not isinstance(parsed, dict) or parsed.get("type") != "service_account":
+            raise ValueError("not a service account")
+        return decoded
+    except Exception as error:
+        raise ConfigurationError("GOOGLE_SERVICE_ACCOUNT_JSON_B64 형식이 올바르지 않습니다.") from error
+
+
 @dataclass(frozen=True)
 class Settings:
     app_base_url: str
@@ -78,6 +98,7 @@ class Settings:
     gmail_client_secret: str | None
     openai_api_key: str | None
     openai_model: str
+    google_service_account_json: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -110,6 +131,7 @@ class Settings:
             gmail_client_secret=_value_or_secret("GMAIL_CLIENT_SECRET"),
             openai_api_key=_value_or_secret("OPENAI_API_KEY"),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-5-mini"),
+            google_service_account_json=_service_account_json(),
         )
 
     def callback_url(self, provider: str) -> str:

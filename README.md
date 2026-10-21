@@ -58,3 +58,11 @@ cp .env.example .env
 - Jira 권한은 연결한 사용자 계정 기준으로 API가 허용한 자료만 사용한다.
 - `gmail.readonly`는 Google의 제한적 범위다. 외부 사용자에게 배포하거나 서버에 관련 데이터를 보관하는 방식은 Google Workspace 정책과 OAuth 검증 요건을 확인해야 한다.
 - Gmail REST API가 안정적인 원문 웹 링크를 보장하지 않는 경우, 앱은 링크를 지어내지 않고 가장 가까운 메일 식별 정보만 표시해야 한다.
+
+## Render deployment note
+
+For Render, use `STORAGE_BACKEND=firestore` and set `GOOGLE_SERVICE_ACCOUNT_JSON_B64`
+as a **secret environment variable**. Its value is a base64-encoded JSON key for a
+dedicated service account that has only `roles/datastore.user` and
+`roles/secretmanager.secretAccessor` in `case-finder-test`. Do not commit the key,
+put it in `.env`, or paste it into Slack.

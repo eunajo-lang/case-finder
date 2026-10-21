@@ -15,7 +15,11 @@ def build_store(settings):
     if settings.storage_backend == "sqlite":
         return ConnectionStore(settings.database_path, settings.token_encryption_key)
     if settings.storage_backend == "firestore":
-        return FirestoreConnectionStore(settings.firestore_collection_prefix, settings.token_encryption_key)
+        return FirestoreConnectionStore(
+            settings.firestore_collection_prefix,
+            settings.token_encryption_key,
+            service_account_json=settings.google_service_account_json,
+        )
     raise ValueError("STORAGE_BACKEND는 sqlite 또는 firestore여야 합니다.")
 
 
@@ -203,10 +207,16 @@ class ConnectionStore:
 class FirestoreConnectionStore:
     """Cloud Run production store. OAuth secrets remain Fernet-encrypted."""
 
-    def __init__(self, prefix: str, encryption_key: str):
+    def __init__(self, prefix: str, encryption_key: str, *, service_account_json: str | None = None):
         from google.cloud import firestore
 
-        self._db = firestore.Client()
+        if service_account_json:
+            from google.oauth2 import service_account
+
+            credentials = service_account.Credentials.from_service_account_info(json.loads(service_account_json))
+            self._db = firestore.Client(credentials=credentials, project=credentials.project_id)
+        else:
+            self._db = firestore.Client()
         self._prefix = prefix
         self._fernet = Fernet(encryption_key.encode("ascii"))
 
