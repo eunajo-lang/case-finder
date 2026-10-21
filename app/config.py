@@ -82,7 +82,10 @@ def _service_account_json() -> str | None:
     if not encoded:
         return None
     try:
-        decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+        # Some deployment UIs trim trailing '=' padding. Restore only the
+        # required padding; strict validation still rejects non-base64 data.
+        padded = encoded + ("=" * (-len(encoded) % 4))
+        decoded = base64.b64decode(padded, validate=True).decode("utf-8")
         parsed = json.loads(decoded)
         if not isinstance(parsed, dict) or parsed.get("type") != "service_account":
             raise ValueError("not a service account")
