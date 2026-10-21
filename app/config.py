@@ -26,6 +26,8 @@ def _required(name: str) -> str:
 class Settings:
     app_base_url: str
     database_path: Path
+    storage_backend: str
+    firestore_collection_prefix: str
     token_encryption_key: str
     state_signing_secret: str
     slack_signing_secret: str
@@ -55,6 +57,8 @@ class Settings:
         return cls(
             app_base_url=base_url,
             database_path=Path(os.getenv("DATABASE_PATH", "data/case_finder.sqlite3")),
+            storage_backend=os.getenv("STORAGE_BACKEND", "sqlite").lower(),
+            firestore_collection_prefix=os.getenv("FIRESTORE_COLLECTION_PREFIX", "case_finder"),
             token_encryption_key=key,
             state_signing_secret=_required("STATE_SIGNING_SECRET"),
             slack_signing_secret=_required("SLACK_SIGNING_SECRET"),

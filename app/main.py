@@ -12,12 +12,12 @@ from .models import Provider
 from .oauth import OAuthClient, OAuthError
 from .security import SecurityError, StateSigner, state_digest, verify_slack_signature
 from .services import AnswerService, SearchService
-from .store import ConnectionStore
+from .store import build_store
 
 
 def create_app(settings: Settings) -> FastAPI:
     app = FastAPI(title="Case Finder", docs_url=None, redoc_url=None)
-    store = ConnectionStore(settings.database_path, settings.token_encryption_key)
+    store = build_store(settings)
     signer = StateSigner(settings.state_signing_secret)
     oauth = OAuthClient(settings)
     search = SearchService(settings, store)

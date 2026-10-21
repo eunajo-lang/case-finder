@@ -13,6 +13,8 @@ def settings(tmp_path):
     return Settings(
         app_base_url="http://127.0.0.1:8000",
         database_path=tmp_path / "case-finder.sqlite3",
+        storage_backend="sqlite",
+        firestore_collection_prefix="case_finder",
         token_encryption_key=Fernet.generate_key().decode(),
         state_signing_secret="state-secret",
         slack_signing_secret="slack-secret",

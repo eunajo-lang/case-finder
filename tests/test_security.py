@@ -30,6 +30,6 @@ def test_oauth_state_is_provider_bound_and_signed():
     assert signer.verify(value, "gmail") == issued
     with pytest.raises(SecurityError):
         signer.verify(value, "jira")
-    tampered = value[:-1] + ("A" if value[-1] != "A" else "B")
+    tampered = ("A" if value[0] != "A" else "B") + value[1:]
     with pytest.raises(SecurityError):
         signer.verify(tampered, "gmail")

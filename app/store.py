@@ -3,11 +3,20 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+import base64
 from pathlib import Path
 
 from cryptography.fernet import Fernet
 
 from .models import Provider
+
+
+def build_store(settings):
+    if settings.storage_backend == "sqlite":
+        return ConnectionStore(settings.database_path, settings.token_encryption_key)
+    if settings.storage_backend == "firestore":
+        return FirestoreConnectionStore(settings.firestore_collection_prefix, settings.token_encryption_key)
+    raise ValueError("STORAGE_BACKEND는 sqlite 또는 firestore여야 합니다.")
 
 
 class ConnectionStore:
@@ -189,3 +198,92 @@ class ConnectionStore:
             "INSERT INTO audit_events(slack_user_id, action, provider, occurred_at, details_json) VALUES(?, ?, ?, ?, ?)",
             (slack_user_id, action, provider.value if provider else None, int(time.time()), json.dumps(details or {})),
         )
+
+
+class FirestoreConnectionStore:
+    """Cloud Run production store. OAuth secrets remain Fernet-encrypted."""
+
+    def __init__(self, prefix: str, encryption_key: str):
+        from google.cloud import firestore
+
+        self._db = firestore.Client()
+        self._prefix = prefix
+        self._fernet = Fernet(encryption_key.encode("ascii"))
+
+    def _doc(self, collection: str, key: str):
+        return self._db.collection(f"{self._prefix}_{collection}").document(key)
+
+    def save_connection(self, *, provider, slack_user_id, access_token, expires_at=None, scopes=None):
+        encrypted = base64.urlsafe_b64encode(self._fernet.encrypt(access_token.encode())).decode()
+        self._doc("connections", f"{provider.value}--{slack_user_id}").set(
+            {"provider": provider.value, "slack_user_id": slack_user_id, "encrypted_token": encrypted,
+             "expires_at": expires_at, "scopes": scopes or [], "updated_at": int(time.time())}
+        )
+        self.audit(slack_user_id=slack_user_id, action="connection_saved", provider=provider)
+
+    def save_token_bundle(self, *, provider, slack_user_id, bundle, scopes=None):
+        expires_in = bundle.get("expires_in")
+        self.save_connection(provider=provider, slack_user_id=slack_user_id,
+            access_token=json.dumps(bundle, separators=(",", ":")),
+            expires_at=int(time.time()) + expires_in - 60 if isinstance(expires_in, int) else None,
+            scopes=scopes)
+
+    def _raw_connection(self, provider, slack_user_id):
+        snapshot = self._doc("connections", f"{provider.value}--{slack_user_id}").get()
+        if not snapshot.exists:
+            return None
+        return self._fernet.decrypt(base64.urlsafe_b64decode(snapshot.to_dict()["encrypted_token"])).decode()
+
+    def access_token(self, *, provider, slack_user_id):
+        raw = self._raw_connection(provider, slack_user_id)
+        if raw is None:
+            return None
+        try:
+            bundle = json.loads(raw)
+            return bundle.get("access_token") if isinstance(bundle, dict) else raw
+        except json.JSONDecodeError:
+            return raw
+
+    def token_bundle(self, *, provider, slack_user_id):
+        raw = self._raw_connection(provider, slack_user_id)
+        if raw is None:
+            return None
+        try:
+            value = json.loads(raw)
+            return value if isinstance(value, dict) else {"access_token": raw}
+        except json.JSONDecodeError:
+            return {"access_token": raw}
+
+    def delete_connection(self, *, provider, slack_user_id, action="connection_removed"):
+        self._doc("connections", f"{provider.value}--{slack_user_id}").delete()
+        self.audit(slack_user_id=slack_user_id, action=action, provider=provider)
+
+    def connected_providers(self, slack_user_id):
+        docs = self._db.collection(f"{self._prefix}_connections").where("slack_user_id", "==", slack_user_id).stream()
+        return {Provider(doc.to_dict()["provider"]) for doc in docs}
+
+    def save_oauth_state(self, *, digest, provider, slack_user_id, expires_at):
+        self._doc("oauth_states", digest).create({"provider": provider.value, "slack_user_id": slack_user_id, "expires_at": expires_at})
+
+    def consume_oauth_state(self, *, digest, provider, slack_user_id):
+        ref = self._doc("oauth_states", digest)
+        transaction = self._db.transaction()
+        from google.cloud import firestore
+        @firestore.transactional
+        def consume(transaction, ref):
+            snapshot = ref.get(transaction=transaction)
+            transaction.delete(ref)
+            data = snapshot.to_dict() if snapshot.exists else None
+            return bool(data and data["provider"] == provider.value and data["slack_user_id"] == slack_user_id and data["expires_at"] >= int(time.time()))
+        return consume(transaction, ref)
+
+    def claim_event(self, event_id):
+        try:
+            self._doc("handled_events", event_id).create({"received_at": int(time.time())})
+            return True
+        except Exception:
+            return False
+
+    def audit(self, *, slack_user_id, action, provider=None, details=None):
+        self._db.collection(f"{self._prefix}_audit_events").add({"slack_user_id": slack_user_id, "action": action,
+            "provider": provider.value if provider else None, "occurred_at": int(time.time()), "details": details or {}})
