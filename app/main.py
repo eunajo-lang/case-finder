@@ -92,9 +92,8 @@ async def handle_question(
     event: dict[str, Any],
 ) -> None:
     connected = store.connected_providers(slack_user_id)
-    missing = [provider for provider in Provider if provider not in connected]
-    if missing:
-        message = _connection_message(settings, store, signer, oauth, slack_user_id, missing)
+    if not connected:
+        message = _connection_message(settings, store, signer, oauth, slack_user_id, list(Provider))
     else:
         try:
             outcome = await search.search(slack_user_id=slack_user_id, question=text)
