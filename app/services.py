@@ -23,26 +23,40 @@ class SearchService:
         self.settings = settings
         self.store = store
 
-    async def search(self, *, slack_user_id: str, question: str) -> SearchOutcome:
+    async def search(
+        self,
+        *,
+        slack_user_id: str,
+        question: str,
+        slack_conversation_id: str | None = None,
+        exclude_slack_message_ts: str | None = None,
+    ) -> SearchOutcome:
         tasks = []
         active: list[tuple[Provider, object]] = []
         slack_token = self.store.access_token(provider=Provider.SLACK, slack_user_id=slack_user_id)
         if slack_token:
             reader = SlackReader(slack_token, slack_user_id)
             active.append((Provider.SLACK, reader))
-            tasks.append(reader.search(question))
-        jira_token = self.store.access_token(provider=Provider.JIRA, slack_user_id=slack_user_id)
-        jira_bundle = self.store.token_bundle(provider=Provider.JIRA, slack_user_id=slack_user_id) or {}
-        jira_cloud_id = jira_bundle.get("cloud_id") or self.settings.jira_cloud_id
-        if jira_token and isinstance(jira_cloud_id, str):
-            reader = JiraReader(jira_token, jira_cloud_id)
-            active.append((Provider.JIRA, reader))
-            tasks.append(reader.search(question))
-        gmail_token = self.store.access_token(provider=Provider.GMAIL, slack_user_id=slack_user_id)
-        if gmail_token:
-            reader = GmailReader(gmail_token)
-            active.append((Provider.GMAIL, reader))
-            tasks.append(reader.search(question))
+            tasks.append(
+                reader.search(
+                    question,
+                    only_conversation_id=slack_conversation_id,
+                    exclude_message_ts=exclude_slack_message_ts,
+                )
+            )
+        if slack_conversation_id is None:
+            jira_token = self.store.access_token(provider=Provider.JIRA, slack_user_id=slack_user_id)
+            jira_bundle = self.store.token_bundle(provider=Provider.JIRA, slack_user_id=slack_user_id) or {}
+            jira_cloud_id = jira_bundle.get("cloud_id") or self.settings.jira_cloud_id
+            if jira_token and isinstance(jira_cloud_id, str):
+                reader = JiraReader(jira_token, jira_cloud_id)
+                active.append((Provider.JIRA, reader))
+                tasks.append(reader.search(question))
+            gmail_token = self.store.access_token(provider=Provider.GMAIL, slack_user_id=slack_user_id)
+            if gmail_token:
+                reader = GmailReader(gmail_token)
+                active.append((Provider.GMAIL, reader))
+                tasks.append(reader.search(question))
 
         unavailable = [provider for provider in Provider if provider not in [item[0] for item in active]]
         try:

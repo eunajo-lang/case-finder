@@ -51,13 +51,26 @@ class SlackReader:
             # A source that cannot be re-checked is excluded rather than surfaced.
             return None
 
-    async def search(self, query: str, limit: int = 20) -> list[SourceRecord]:
+    async def search(
+        self,
+        query: str,
+        limit: int = 20,
+        *,
+        only_conversation_id: str | None = None,
+        exclude_message_ts: str | None = None,
+    ) -> list[SourceRecord]:
         result = await self._api("search.messages", query=query, count=min(limit, 20), sort="timestamp")
         records: list[SourceRecord] = []
         checked: dict[str, SlackConversation | None] = {}
         for match in result.get("messages", {}).get("matches", []):
             conversation_id = match.get("channel", {}).get("id")
             if not conversation_id:
+                continue
+            if only_conversation_id and conversation_id != only_conversation_id:
+                continue
+            if exclude_message_ts and match.get("ts") == exclude_message_ts:
+                # The question just sent to the app is input, not work-history
+                # evidence. Never cite it back as an answer source.
                 continue
             if conversation_id not in checked:
                 checked[conversation_id] = await self._conversation(conversation_id)

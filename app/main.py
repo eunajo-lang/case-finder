@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Optional
 
 import httpx
@@ -46,10 +47,27 @@ def create_app(settings: Settings) -> FastAPI:
         event = payload.get("event", {})
         if not event_id or not store.claim_event(event_id):
             return JSONResponse({"ok": True})
-        if event.get("type") == "message" and event.get("channel_type") == "im" and not event.get("bot_id"):
+        is_direct_message = event.get("type") == "message" and event.get("channel_type") == "im"
+        is_channel_mention = event.get("type") == "app_mention"
+        if (is_direct_message or is_channel_mention) and not event.get("bot_id"):
             user_id, channel_id, text = event.get("user"), event.get("channel"), event.get("text", "").strip()
+            if is_channel_mention:
+                text = re.sub(r"<@[A-Z0-9]+>", "", text).strip()
             if user_id and channel_id and text:
-                tasks.add_task(handle_question, settings, store, signer, oauth, search, answer, user_id, channel_id, text, event)
+                tasks.add_task(
+                    handle_question,
+                    settings,
+                    store,
+                    signer,
+                    oauth,
+                    search,
+                    answer,
+                    user_id,
+                    channel_id,
+                    text,
+                    event,
+                    channel_id if is_channel_mention else None,
+                )
         return JSONResponse({"ok": True})
 
     @app.get("/oauth/{provider}/callback", response_class=HTMLResponse)
@@ -90,13 +108,19 @@ async def handle_question(
     channel_id: str,
     text: str,
     event: dict[str, Any],
+    source_conversation_id: str | None = None,
 ) -> None:
     connected = store.connected_providers(slack_user_id)
     if not connected:
         message = _connection_message(settings, store, signer, oauth, slack_user_id, list(Provider))
     else:
         try:
-            outcome = await search.search(slack_user_id=slack_user_id, question=text)
+            outcome = await search.search(
+                slack_user_id=slack_user_id,
+                question=text,
+                slack_conversation_id=source_conversation_id,
+                exclude_slack_message_ts=event.get("ts"),
+            )
             message = await answer.compose(question=text, outcome=outcome)
         except Exception:
             # Do not include provider error text: it might expose source or configuration details.
