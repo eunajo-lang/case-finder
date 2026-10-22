@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from app.connectors import SlackReader, slack_minimum_focus_matches, slack_query_variants
+from app.connectors import SlackReader, slack_focus_terms, slack_minimum_focus_matches, slack_query_variants
 from app.models import Provider, SlackConversation, SourceRecord
 from app.services import AnswerService, SearchOutcome, redact_sensitive_text
 
@@ -142,8 +142,20 @@ def test_korean_query_planner_is_bounded_and_expands_registration_complaint():
 def test_query_planner_prioritizes_company_feature_and_input_symptom():
     queries = slack_query_variants("서울도시가스 고객이 자가검침 기간인데 입력이 안된다는 민원을 보냈어")
 
-    assert queries == ["서울도시가스 자가검침", "자가검침 입력", "자가검침", "서울도시가스"]
+    assert queries == ["서울도시가스 자가검침", "서울도시가스 입력", "자가검침 입력", "서울도시가스"]
     assert "도시가스" not in queries
+
+
+def test_query_planner_prioritizes_incident_words_over_conversational_words():
+    question = "서울도시가스에서 이번에 또 미납요금 확정 작업 전에 미납요금이 노출됐대. 히스토리 보여줘."
+
+    assert slack_focus_terms(question) == ["서울도시가스", "미납", "확정", "노출"]
+    assert slack_query_variants(question) == [
+        "서울도시가스 미납",
+        "서울도시가스 확정",
+        "미납 확정",
+        "미납 노출",
+    ]
 
 
 def test_named_company_question_requires_company_and_feature_match():

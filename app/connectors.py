@@ -112,6 +112,24 @@ _INCIDENT_EXPANSIONS = {
     "불가": ("불가", "입력", "오류"),
 }
 
+# These terms describe the business feature or incident. They must take
+# precedence over conversational words such as "이번" or "히스토리".
+_DOMAIN_FEATURE_TERMS = (
+    "자가검침",
+    "검침일자",
+    "확정일자",
+    "미납",
+    "확정",
+    "노출",
+    "청구서",
+    "직수납",
+    "고지서",
+    "동기화",
+    "입력",
+    "미입력",
+    "오류",
+)
+
 _QUERY_CONTEXT_TERMS = {
     "고객",
     "기간",
@@ -130,6 +148,12 @@ _QUERY_CONTEXT_TERMS = {
     "쿼리",
     "뭐였지",
     "들어왔",
+    "이번",
+    "또",
+    "전에",
+    "작업",
+    "히스토리",
+    "보여줘",
 }
 
 
@@ -165,12 +189,18 @@ def slack_focus_terms(question: str) -> list[str]:
         if (is_specific_subject or is_feature) and token not in focus:
             focus.append(token)
     specific_subjects = [term for term in focus if anchor and term != anchor and anchor in term]
+    domain_features = [term for term in _DOMAIN_FEATURE_TERMS if term in normalized]
+    if domain_features:
+        # Prefer issue vocabulary over the position of a word in a sentence.
+        # For example, "이번에 또 미납요금 확정 작업 전에 노출" must
+        # become "미납/확정/노출", never "이번".
+        focus = specific_subjects + [term for term in domain_features if term not in specific_subjects]
     if specific_subjects:
         # For a named company/product, its first feature term is the useful
         # discriminator. Keeping question phrasing such as "쿼리가 뭐였지" as
         # a focus term lets unrelated threads look falsely similar.
         features = [term for term in focus if term not in specific_subjects]
-        return specific_subjects[:1] + features[:1]
+        return specific_subjects[:1] + features[:3]
     return focus
 
 
@@ -214,9 +244,15 @@ def slack_query_variants(question: str, maximum: int = 4) -> list[str]:
     if specific_subjects:
         if feature_terms:
             variants.append(f"{specific_subjects[0]} {feature_terms[0]}")
-            if any(term in normalized for term in ("입력", "미입력", "불가", "안되")):
+            if len(feature_terms) >= 2:
+                variants.append(f"{specific_subjects[0]} {feature_terms[1]}")
+                variants.append(f"{feature_terms[0]} {feature_terms[1]}")
+            elif any(term in normalized for term in ("입력", "미입력", "불가", "안되")):
                 variants.append(f"{feature_terms[0]} 입력")
-            variants.append(feature_terms[0])
+            else:
+                variants.append(feature_terms[0])
+            if len(feature_terms) >= 3:
+                variants.append(f"{feature_terms[0]} {feature_terms[2]}")
         variants.append(specific_subjects[0])
     else:
         variants.append(anchor)
@@ -435,8 +471,8 @@ class SlackReader:
                 int(item.metadata.get("focus_match_count", 0)) > 0,
                 int(item.metadata.get("focus_match_score", 0)),
                 int(item.metadata.get("focus_match_count", 0)),
-                tuple(item.metadata.get("retrieval_score", (0, 0, 0))),
                 _slack_timestamp_number(item.metadata.get("latest_message_ts", item.occurred_at)),
+                tuple(item.metadata.get("retrieval_score", (0, 0, 0))),
             ),
             reverse=True,
         )
