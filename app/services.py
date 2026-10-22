@@ -148,13 +148,22 @@ class AnswerService:
             )
             return self._with_source_links(redact_sensitive_text(answer), selected)
         except httpx.HTTPStatusError as error:
-            logger.warning("OpenAI summary request failed with HTTP %s", error.response.status_code)
-            return self._evidence_only(selected_outcome, provider_problem=True)
+            status = error.response.status_code
+            logger.warning("OpenAI summary request failed with HTTP %s", status)
+            return self._evidence_only(
+                selected_outcome,
+                provider_problem=True,
+                provider_diagnostic=f"HTTP {status}",
+            )
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as error:
             logger.warning("OpenAI summary request failed: %s", type(error).__name__)
             # A source-grounded comparison remains useful even if the AI service
             # is unavailable. It never invents an incident outcome.
-            return self._evidence_only(selected_outcome, provider_problem=True)
+            return self._evidence_only(
+                selected_outcome,
+                provider_problem=True,
+                provider_diagnostic=type(error).__name__,
+            )
 
     @staticmethod
     def _answer_records(records: list[SourceRecord]) -> list[SourceRecord]:
@@ -185,7 +194,12 @@ class AnswerService:
         return "접근 가능한 기록에서 관련 사례를 찾지 못했습니다." + connected + " 기록이 없었다고 단정할 수는 없습니다."
 
     @classmethod
-    def _evidence_only(cls, outcome: SearchOutcome, provider_problem: bool = False) -> str:
+    def _evidence_only(
+        cls,
+        outcome: SearchOutcome,
+        provider_problem: bool = False,
+        provider_diagnostic: str | None = None,
+    ) -> str:
         records = cls._answer_records(outcome.records)
         lines = [
             "*핵심 결론*",
@@ -197,7 +211,8 @@ class AnswerService:
             "*유사 사례*",
         ]
         if provider_problem:
-            lines.append("AI 요약 서비스에 연결하지 못해, 아래는 원문에서 확인되는 내용만 정리했습니다.")
+            detail = f" (진단 코드: {provider_diagnostic})" if provider_diagnostic else ""
+            lines.append("AI 요약 서비스에 연결하지 못해, 아래는 원문에서 확인되는 내용만 정리했습니다." + detail)
         for index, item in enumerate(records, 1):
             lines.extend(cls._fallback_case_lines(index, item))
         lines.extend(
@@ -291,15 +306,20 @@ class AnswerService:
         instruction = """당신은 업무 기록을 비교해 설명하는 한국어 비서다. 제공된 사례의 텍스트만 근거로 쓴다.
 추측, 일반 지식, 질문의 주장만으로 사실을 만들지 않는다. 서로 다른 사례를 하나의 사건으로 합치지 않는다.
 
-답변은 짧고 반드시 아래 순서를 따른다.
-*핵심 결론*
-*현재 민원에서 먼저 확인할 사항*
-*유사 사례*
-  - 사례마다 반드시 `현상`, `기록상 원인`, `당시 안내·조치`, `기록상 완료 여부`를 쓴다.
-*이번 건에 그대로 적용할 수 없는 점*
+        답변은 짧고, 원문을 길게 인용하지 말고 반드시 아래 순서를 따른다.
+        *답변*
+          - 질문에 대한 직접 답을 첫 1~3문장에 쓴다.
+          - 질문이 특정 쿼리·SQL·링크·식별값을 묻는 경우, 그 정확한 값이 사례에 있으면 제시하고 없으면 `기록상 실제 값은 확인되지 않습니다`라고 명확히 말한다. 절대로 값을 추정하거나 만들어 내지 않는다.
+        *근거 요약*
+          - 질문과 가장 가까운 사례 1~3건만 쓴다. 각 사례는 한두 문장으로 `현상 → 기록상 판단 또는 조치`만 압축한다.
+        *다음 확인처 또는 확인 사항*
+          - 원문·Jira·메일 등 기록에 명시된 추적 위치가 있으면 제시한다. 없으면 이번 건에서 확인할 사실만 쓴다.
+        *적용 시 주의*
+          - 과거 사례를 이번 건의 확정 원인이나 확정 조치로 표현하지 않는다.
 
 규칙:
-- 사례가 한 건이면 한 건이라고 말한다. 여러 사례가 있는 것처럼 만들지 않는다.
+        - 사례가 한 건이면 한 건이라고 말한다. 여러 사례가 있는 것처럼 만들지 않는다.
+        - 질문과 무관한 사례는 답변을 채우기 위해 언급하지 않는다.
 - 원인이 명시되지 않았으면 `기록상 원인 미확인`이라고 쓴다.
 - 조치가 제안·검토·확인 중이면 완료로 바꾸지 않는다. 완료 표현이 있어도 `기록상 완료로 표현됨`이라고만 쓴다.
 - 사례마다 해당하는 [사례 N]을 붙인다. 링크는 답변 뒤에 시스템이 붙이므로 URL을 만들거나 쓰지 않는다.

@@ -154,6 +154,18 @@ def test_evidence_fallback_redacts_sensitive_values_and_does_not_overclaim():
     assert "safescg.slack.com" not in model_text
 
 
+def test_evidence_fallback_exposes_only_safe_model_failure_diagnostic():
+    case = _case("C_PUBLIC:1710000000.000100", ["자가검침 입력 오류", "확인 중입니다."])
+
+    answer = AnswerService._evidence_only(
+        SearchOutcome(records=[case], unavailable=[]),
+        provider_problem=True,
+        provider_diagnostic="HTTP 429",
+    )
+
+    assert "진단 코드: HTTP 429" in answer
+
+
 def test_in_progress_record_is_not_presented_as_completed():
     case = _case("C_PUBLIC:1710000000.000100", ["청구서가 보이지 않습니다.", "현재 확인 중입니다."])
 
