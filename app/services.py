@@ -164,7 +164,17 @@ class AnswerService:
             for item in records
             if item.provider == Provider.SLACK and item.metadata.get("case_kind") == "slack_thread"
         ]
-        other_records = [item for item in records if item not in slack_cases]
+        focused_cases = [item for item in slack_cases if item.metadata.get("focus_match_count", 0)]
+        # Once retrieval found a case that contains a distinctive term from the
+        # question (company, product, or feature), do not dilute the answer with
+        # generic subject-only cases such as unrelated "도시가스" conversations.
+        if focused_cases:
+            slack_cases = focused_cases
+        other_records = [
+            item
+            for item in records
+            if not (item.provider == Provider.SLACK and item.metadata.get("case_kind") == "slack_thread")
+        ]
         # Four cases are enough to compare patterns without making a private-DM
         # answer a dump of unrelated historical conversations.
         return slack_cases[:4] + other_records[: max(0, 4 - len(slack_cases[:4]))]
@@ -182,7 +192,7 @@ class AnswerService:
             f"현재 민원과 비교할 수 있는 기록상 사례는 {len(records)}건입니다. 기록만으로 이번 건의 원인을 하나로 단정할 수는 없습니다.",
             "",
             "*현재 민원에서 먼저 확인할 사항*",
-            "신청·등록 상태, 계약/청구 정보 반영 여부, 오류 화면과 발생 시점을 먼저 확인해 주세요.",
+            "오류 문구·화면, 발생 시점, 해당 기능의 이용 조건과 처리 상태를 먼저 확인해 주세요.",
             "",
             "*유사 사례*",
         ]

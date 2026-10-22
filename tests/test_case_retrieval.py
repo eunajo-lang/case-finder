@@ -97,6 +97,13 @@ def test_korean_query_planner_is_bounded_and_expands_registration_complaint():
     assert all("알려" not in query for query in queries)
 
 
+def test_query_planner_prioritizes_company_feature_and_input_symptom():
+    queries = slack_query_variants("서울도시가스 고객이 자가검침 기간인데 입력이 안된다는 민원을 보냈어")
+
+    assert queries == ["서울도시가스 자가검침", "자가검침 입력", "자가검침", "서울도시가스"]
+    assert "도시가스" not in queries
+
+
 def test_slack_hits_in_one_thread_become_one_case_and_current_dm_is_excluded():
     reader = FakeSlackReader()
 
@@ -172,6 +179,16 @@ def test_answer_uses_at_most_four_distinct_slack_cases():
         source_url=None,
     )
     assert len(AnswerService._answer_records(cases[:4] + [external])) == 4
+
+
+def test_answer_drops_broad_slack_cases_when_focused_case_exists():
+    focused = _case("C_PUBLIC:focused", ["서울도시가스 자가검침 입력 불가"])
+    focused.metadata["focus_match_count"] = 2
+    broad = _case("C_PUBLIC:broad", ["도시가스 계약 관련 회의"])
+
+    selected = AnswerService._answer_records([broad, focused])
+
+    assert [case.source_id for case in selected] == ["C_PUBLIC:focused"]
 
 
 def test_redactor_handles_unlabelled_phone_identifier_name_and_address():

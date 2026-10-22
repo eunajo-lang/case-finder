@@ -38,6 +38,8 @@ _KOREAN_ENDINGS = (
     "하는데",
     "되는데",
     "됐는데",
+    "인데",
+    "는데",
     "합니다",
     "했습니다",
     "해주세요",
@@ -45,6 +47,9 @@ _KOREAN_ENDINGS = (
     "인가요",
     "입니다",
     "이었어요",
+    "었어",
+    "았어",
+    "냈어",
     "었어요",
     "아요",
     "어요",
@@ -63,7 +68,21 @@ _KOREAN_ENDINGS = (
     "를",
     "에",
 )
-_INCIDENT_TERMS = ("신청", "등록", "조회", "미납", "주소", "오류", "고지서", "카드", "해지", "동기화")
+_INCIDENT_TERMS = (
+    "신청",
+    "등록",
+    "조회",
+    "미납",
+    "주소",
+    "오류",
+    "고지서",
+    "카드",
+    "해지",
+    "동기화",
+    "입력",
+    "미입력",
+    "불가",
+)
 _SUBJECT_TERMS = (
     "전기요금",
     "도시가스",
@@ -88,7 +107,59 @@ _INCIDENT_EXPANSIONS = {
     "카드": ("카드", "계약", "조회"),
     "해지": ("해지", "재신청", "등록"),
     "동기화": ("동기화", "등록", "조회"),
+    "입력": ("입력", "미입력", "불가"),
+    "미입력": ("미입력", "입력", "불가"),
+    "불가": ("불가", "입력", "오류"),
 }
+
+_QUERY_CONTEXT_TERMS = {
+    "고객",
+    "기간",
+    "중",
+    "입력",
+    "미입력",
+    "불가",
+    "안된다",
+    "안됨",
+    "안되",
+    "보냈",
+    "보냈어",
+    "들어왔",
+}
+
+
+def _question_tokens(question: str) -> list[str]:
+    """Extract stable lexical terms from a Korean natural-language question."""
+    normalized = re.sub(r"[^0-9A-Za-z가-힣]+", " ", question).strip()
+    tokens: list[str] = []
+    for raw in re.findall(r"[0-9A-Za-z가-힣]{2,}", normalized):
+        token = raw.lower()
+        for ending in _KOREAN_ENDINGS:
+            if token.endswith(ending) and len(token) - len(ending) >= 2:
+                token = token[: -len(ending)]
+                break
+        if token and token not in _QUERY_FILLER_WORDS and token not in tokens:
+            tokens.append(token)
+    return tokens
+
+
+def slack_focus_terms(question: str) -> list[str]:
+    """Return distinctive business terms used to reject broad, unrelated hits.
+
+    Subject words such as ``도시가스`` occur in too many unrelated discussions.
+    A longer company/product term (``서울도시가스``) and a feature term
+    (``자가검침``) carry much more retrieval signal, so retain them separately.
+    """
+    normalized = re.sub(r"[^0-9A-Za-z가-힣]+", " ", question).strip()
+    tokens = _question_tokens(question)
+    anchor = next((term for term in _SUBJECT_TERMS if term in normalized), None)
+    focus: list[str] = []
+    for token in tokens:
+        is_specific_subject = bool(anchor and token != anchor and anchor in token)
+        is_feature = token not in _QUERY_CONTEXT_TERMS and token not in _SUBJECT_TERMS
+        if (is_specific_subject or is_feature) and token not in focus:
+            focus.append(token)
+    return focus
 
 
 def slack_query_variants(question: str, maximum: int = 4) -> list[str]:
@@ -100,22 +171,29 @@ def slack_query_variants(question: str, maximum: int = 4) -> list[str]:
     bounded to limit data retrieval and API calls.
     """
     normalized = re.sub(r"[^0-9A-Za-z가-힣]+", " ", question).strip()
-    tokens: list[str] = []
-    for raw in re.findall(r"[0-9A-Za-z가-힣]{2,}", normalized):
-        token = raw.lower()
-        for ending in _KOREAN_ENDINGS:
-            if token.endswith(ending) and len(token) - len(ending) >= 2:
-                token = token[: -len(ending)]
-                break
-        if token and token not in _QUERY_FILLER_WORDS and token not in tokens:
-            tokens.append(token)
+    tokens = _question_tokens(question)
 
     if not tokens:
         return []
 
     # Prefer an identifiable business object over an adjective such as "정상적".
     anchor = next((term for term in _SUBJECT_TERMS if term in normalized), max(tokens, key=len))
-    variants = [anchor]
+    focus = slack_focus_terms(question)
+    specific_subjects = [term for term in focus if anchor in term and term != anchor]
+    feature_terms = [term for term in focus if term not in specific_subjects]
+
+    # An organization/product plus its feature is more discriminating than the
+    # broad subject. Search it before expanding generic incident vocabulary.
+    variants: list[str] = []
+    if specific_subjects:
+        if feature_terms:
+            variants.append(f"{specific_subjects[0]} {feature_terms[0]}")
+            if any(term in normalized for term in ("입력", "미입력", "불가", "안되")):
+                variants.append(f"{feature_terms[0]} 입력")
+            variants.append(feature_terms[0])
+        variants.append(specific_subjects[0])
+    else:
+        variants.append(anchor)
     incident_terms: list[str] = []
     for marker, expansions in _INCIDENT_EXPANSIONS.items():
         if marker in normalized:
@@ -201,6 +279,8 @@ class SlackReader:
         queries = slack_query_variants(question)
         if not queries:
             return []
+        focus_terms = slack_focus_terms(question)
+        query_rank = {query: len(queries) - index for index, query in enumerate(queries)}
 
         candidates: dict[tuple[str, str], dict[str, Any]] = {}
         for query in queries:
@@ -239,8 +319,9 @@ class SlackReader:
                     or paging.get("page", 1) < paging.get("pages", 1)
                 )
 
-        def priority(candidate: dict[str, Any]) -> tuple[int, int, float]:
+        def priority(candidate: dict[str, Any]) -> tuple[int, int, int, float]:
             return (
+                sum(query_rank[query] for query in candidate["matched_queries"]),
                 len(candidate["matched_queries"]),
                 len(candidate["matched_timestamps"]),
                 _slack_timestamp_number(candidate["root_ts"]),
@@ -253,8 +334,6 @@ class SlackReader:
         # This avoids a conversations.info request for every lexical hit.
         candidate_review_limit = max(4, min(max(limit * 2, 4), 8))
         for candidate in sorted(candidates.values(), key=priority, reverse=True)[:candidate_review_limit]:
-            if len(records) >= limit:
-                break
             conversation_id = candidate["conversation_id"]
             root_ts = candidate["root_ts"]
             if conversation_id not in checked:
@@ -291,6 +370,8 @@ class SlackReader:
             except (ConnectorError, httpx.HTTPError):
                 permalink = None
             thread_text = "\n".join(item["text"] for item in messages)[:12000]
+            normalized_thread = thread_text.lower()
+            focus_matches = [term for term in focus_terms if term in normalized_thread]
             records.append(
                 SourceRecord(
                     provider=Provider.SLACK,
@@ -306,7 +387,9 @@ class SlackReader:
                         "latest_message_ts": latest_ts,
                         "thread_messages": messages,
                         "matched_queries": sorted(candidate["matched_queries"]),
-                        "retrieval_score": priority(candidate)[:2],
+                        "retrieval_score": priority(candidate)[:3],
+                        "focus_matches": focus_matches,
+                        "focus_match_count": len(focus_matches),
                         "thread_may_be_truncated": thread_may_be_truncated,
                         "search_may_be_incomplete": candidate["search_may_be_incomplete"],
                     },
@@ -314,12 +397,19 @@ class SlackReader:
             )
         records.sort(
             key=lambda item: (
-                tuple(item.metadata.get("retrieval_score", (0, 0))),
+                int(item.metadata.get("focus_match_count", 0)) > 0,
+                int(item.metadata.get("focus_match_count", 0)),
+                tuple(item.metadata.get("retrieval_score", (0, 0, 0))),
                 _slack_timestamp_number(item.metadata.get("latest_message_ts", item.occurred_at)),
             ),
             reverse=True,
         )
-        return records
+        focused_records = [item for item in records if item.metadata.get("focus_match_count", 0)]
+        # When a distinctive company/product/feature term exists in the question,
+        # do not fill the answer with broad subject-only records while focused
+        # records are available. If none are available, retain the best lexical
+        # results and let the answer state that exact matches were not found.
+        return (focused_records or records)[:limit]
 
     async def search(self, query: str, limit: int = 20) -> list[SourceRecord]:
         """Compatibility wrapper for callers that need Slack search evidence."""
