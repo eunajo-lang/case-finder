@@ -139,7 +139,7 @@ class AnswerService:
             return self._no_records(outcome.unavailable)
         selected_outcome = SearchOutcome(records=selected, unavailable=outcome.unavailable)
         if not self.settings.openai_api_key:
-            return self._evidence_only(selected_outcome)
+            return self._evidence_only(selected_outcome, question=question)
         try:
             answer = await self._openai_answer(
                 question=question,
@@ -152,6 +152,7 @@ class AnswerService:
             logger.warning("OpenAI summary request failed with HTTP %s", status)
             return self._evidence_only(
                 selected_outcome,
+                question=question,
                 provider_problem=True,
                 provider_diagnostic=f"HTTP {status}",
             )
@@ -161,6 +162,7 @@ class AnswerService:
             # is unavailable. It never invents an incident outcome.
             return self._evidence_only(
                 selected_outcome,
+                question=question,
                 provider_problem=True,
                 provider_diagnostic=type(error).__name__,
             )
@@ -197,10 +199,17 @@ class AnswerService:
     def _evidence_only(
         cls,
         outcome: SearchOutcome,
+        question: str | None = None,
         provider_problem: bool = False,
         provider_diagnostic: str | None = None,
     ) -> str:
-        records = cls._answer_records(outcome.records)
+        records = cls._answer_records(outcome.records)[:2]
+        if question and cls._is_lookup_question(question):
+            return cls._lookup_evidence_only(
+                records,
+                provider_problem=provider_problem,
+                provider_diagnostic=provider_diagnostic,
+            )
         lines = [
             "*핵심 결론*",
             f"현재 민원과 비교할 수 있는 기록상 사례는 {len(records)}건입니다. 기록만으로 이번 건의 원인을 하나로 단정할 수는 없습니다.",
@@ -227,10 +236,60 @@ class AnswerService:
         lines.extend(cls._source_link_lines(records))
         return "\n".join(lines)
 
+    @staticmethod
+    def _is_lookup_question(question: str) -> bool:
+        normalized = question.lower()
+        return any(term in normalized for term in ("쿼리", "sql", "조회식", "where절"))
+
+    @classmethod
+    def _lookup_evidence_only(
+        cls,
+        records: list[SourceRecord],
+        *,
+        provider_problem: bool,
+        provider_diagnostic: str | None,
+    ) -> str:
+        """Give a short, honest answer to a query/SQL lookup without inventing it."""
+        literal = cls._query_literal(records)
+        lines = ["*답변*"]
+        if literal:
+            lines.extend(["기록에서 확인된 쿼리입니다.", f"```{literal}```"])
+        else:
+            lines.append("기록상 실제 쿼리 전문은 확인되지 않습니다.")
+        if records:
+            lines.extend(["", "*가장 가까운 기록*"])
+            for index, item in enumerate(records, 1):
+                messages = cls._thread_messages(item)
+                summary = cls._short_text(messages[0] if messages else item.excerpt, 180)
+                lines.append(f"- [사례 {index}] {summary}")
+            lines.extend(
+                [
+                    "",
+                    "*다음 확인처*",
+                    "- 실제 쿼리는 사례 원문에 연결된 Jira 또는 요청 메일에서 확인해야 합니다.",
+                ]
+            )
+        if provider_problem:
+            detail = f" ({provider_diagnostic})" if provider_diagnostic else ""
+            lines.append(f"\n_AI 요약은 현재 사용할 수 없습니다{detail}._")
+        lines.extend(["", "*원문 링크*", *cls._source_link_lines(records)])
+        return "\n".join(lines)
+
+    @classmethod
+    def _query_literal(cls, records: list[SourceRecord]) -> str | None:
+        for item in records:
+            text = "\n".join(cls._thread_messages(item))
+            blocks = re.findall(r"```(?:sql)?\s*(.+?)```", text, flags=re.IGNORECASE | re.DOTALL)
+            for block in blocks:
+                candidate = "\n".join(line.rstrip() for line in block.strip().splitlines())
+                if re.search(r"(?im)^\s*(?:select|update|insert|delete|with)\b", candidate):
+                    return candidate[:1200]
+        return None
+
     @classmethod
     def _fallback_case_lines(cls, index: int, item: SourceRecord) -> list[str]:
         messages = cls._thread_messages(item)
-        symptom = cls._short_text(messages[0] if messages else item.excerpt)
+        symptom = cls._short_text(messages[0] if messages else item.excerpt, 180)
         replies = messages[1:]
         finding = cls._matching_text(
             replies,
@@ -262,10 +321,11 @@ class AnswerService:
         selected = [message for message in messages if any(marker in message for marker in markers)]
         if not selected:
             return ""
-        return " / ".join(cls._short_text(message, 280) for message in selected[:2])
+        return " / ".join(cls._short_text(message, 160) for message in selected[:2])
 
     @staticmethod
     def _short_text(value: str, maximum: int = 360) -> str:
+        value = re.sub(r"<!(?:subteam|channel)\^[^>]+>", "", value)
         compact = " ".join(redact_sensitive_text(value).split())
         if len(compact) <= maximum:
             return compact

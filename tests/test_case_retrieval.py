@@ -166,6 +166,25 @@ def test_evidence_fallback_exposes_only_safe_model_failure_diagnostic():
     assert "진단 코드: HTTP 429" in answer
 
 
+def test_query_lookup_fallback_is_concise_and_never_invents_missing_sql():
+    case = _case(
+        "C_PUBLIC:1710000000.000100",
+        ["서울도시가스 검침일자 변경에 따른 자가검침 예정일자 변경이 필요합니다. 조회 쿼리 공유 요청."],
+    )
+
+    answer = AnswerService._evidence_only(
+        SearchOutcome(records=[case], unavailable=[]),
+        question="서울도시가스 검침일자 변경 쿼리가 뭐였지?",
+        provider_problem=True,
+        provider_diagnostic="HTTP 429",
+    )
+
+    assert "기록상 실제 쿼리 전문은 확인되지 않습니다." in answer
+    assert "가장 가까운 기록" in answer
+    assert "사례 2" not in answer
+    assert "AI 요약은 현재 사용할 수 없습니다 (HTTP 429)." in answer
+
+
 def test_in_progress_record_is_not_presented_as_completed():
     case = _case("C_PUBLIC:1710000000.000100", ["청구서가 보이지 않습니다.", "현재 확인 중입니다."])
 

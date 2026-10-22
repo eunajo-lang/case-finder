@@ -124,6 +124,11 @@ _QUERY_CONTEXT_TERMS = {
     "안되",
     "보냈",
     "보냈어",
+    "변경",
+    "해야",
+    "된대",
+    "쿼리",
+    "뭐였지",
     "들어왔",
 }
 
@@ -159,6 +164,13 @@ def slack_focus_terms(question: str) -> list[str]:
         is_feature = token not in _QUERY_CONTEXT_TERMS and token not in _SUBJECT_TERMS
         if (is_specific_subject or is_feature) and token not in focus:
             focus.append(token)
+    specific_subjects = [term for term in focus if anchor and term != anchor and anchor in term]
+    if specific_subjects:
+        # For a named company/product, its first feature term is the useful
+        # discriminator. Keeping question phrasing such as "쿼리가 뭐였지" as
+        # a focus term lets unrelated threads look falsely similar.
+        features = [term for term in focus if term not in specific_subjects]
+        return specific_subjects[:1] + features[:1]
     return focus
 
 
@@ -280,6 +292,12 @@ class SlackReader:
         if not queries:
             return []
         focus_terms = slack_focus_terms(question)
+        normalized_question = re.sub(r"[^0-9A-Za-z가-힣]+", " ", question).strip()
+        subject_anchor = next((term for term in _SUBJECT_TERMS if term in normalized_question), None)
+        focus_weights = {
+            term: 3 if subject_anchor and term != subject_anchor and subject_anchor in term else 1
+            for term in focus_terms
+        }
         query_rank = {query: len(queries) - index for index, query in enumerate(queries)}
 
         candidates: dict[tuple[str, str], dict[str, Any]] = {}
@@ -372,6 +390,7 @@ class SlackReader:
             thread_text = "\n".join(item["text"] for item in messages)[:12000]
             normalized_thread = thread_text.lower()
             focus_matches = [term for term in focus_terms if term in normalized_thread]
+            focus_match_score = sum(focus_weights[term] for term in focus_matches)
             records.append(
                 SourceRecord(
                     provider=Provider.SLACK,
@@ -390,6 +409,7 @@ class SlackReader:
                         "retrieval_score": priority(candidate)[:3],
                         "focus_matches": focus_matches,
                         "focus_match_count": len(focus_matches),
+                        "focus_match_score": focus_match_score,
                         "thread_may_be_truncated": thread_may_be_truncated,
                         "search_may_be_incomplete": candidate["search_may_be_incomplete"],
                     },
@@ -398,6 +418,7 @@ class SlackReader:
         records.sort(
             key=lambda item: (
                 int(item.metadata.get("focus_match_count", 0)) > 0,
+                int(item.metadata.get("focus_match_score", 0)),
                 int(item.metadata.get("focus_match_count", 0)),
                 tuple(item.metadata.get("retrieval_score", (0, 0, 0))),
                 _slack_timestamp_number(item.metadata.get("latest_message_ts", item.occurred_at)),
