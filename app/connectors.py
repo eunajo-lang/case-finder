@@ -174,6 +174,20 @@ def slack_focus_terms(question: str) -> list[str]:
     return focus
 
 
+def slack_minimum_focus_matches(question: str) -> int:
+    """Return how many distinctive terms a case must contain to be comparable.
+
+    A named company plus a feature is an AND condition, not an OR condition.
+    For example, a company-wide contract meeting is not a comparable incident
+    for a question about that company's self-meter-reading date.
+    """
+    normalized = re.sub(r"[^0-9A-Za-z가-힣]+", " ", question).strip()
+    anchor = next((term for term in _SUBJECT_TERMS if term in normalized), None)
+    focus = slack_focus_terms(question)
+    has_named_subject = bool(anchor and any(term != anchor and anchor in term for term in focus))
+    return 2 if has_named_subject and len(focus) >= 2 else 1
+
+
 def slack_query_variants(question: str, maximum: int = 4) -> list[str]:
     """Create a small, deterministic set of Slack full-text queries.
 
@@ -292,6 +306,7 @@ class SlackReader:
         if not queries:
             return []
         focus_terms = slack_focus_terms(question)
+        minimum_focus_matches = slack_minimum_focus_matches(question)
         normalized_question = re.sub(r"[^0-9A-Za-z가-힣]+", " ", question).strip()
         subject_anchor = next((term for term in _SUBJECT_TERMS if term in normalized_question), None)
         focus_weights = {
@@ -425,12 +440,17 @@ class SlackReader:
             ),
             reverse=True,
         )
-        focused_records = [item for item in records if item.metadata.get("focus_match_count", 0)]
-        # When a distinctive company/product/feature term exists in the question,
-        # do not fill the answer with broad subject-only records while focused
-        # records are available. If none are available, retain the best lexical
-        # results and let the answer state that exact matches were not found.
-        return (focused_records or records)[:limit]
+        if not focus_terms:
+            return records[:limit]
+        comparable_records = [
+            item
+            for item in records
+            if int(item.metadata.get("focus_match_count", 0)) >= minimum_focus_matches
+        ]
+        # Do not pad an answer with a company-only or feature-only hit when the
+        # question names both. Returning no comparable case is more honest than
+        # presenting an unrelated meeting as supporting evidence.
+        return comparable_records[:limit]
 
     async def search(self, query: str, limit: int = 20) -> list[SourceRecord]:
         """Compatibility wrapper for callers that need Slack search evidence."""

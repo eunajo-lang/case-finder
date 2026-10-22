@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from app.connectors import SlackReader, slack_query_variants
+from app.connectors import SlackReader, slack_minimum_focus_matches, slack_query_variants
 from app.models import Provider, SlackConversation, SourceRecord
 from app.services import AnswerService, SearchOutcome, redact_sensitive_text
 
@@ -72,6 +72,48 @@ class FakeSlackReader(SlackReader):
         raise AssertionError(f"unexpected API method: {method}")
 
 
+class FocusSlackReader(SlackReader):
+    """Fixture with one exact case and one company-only, unrelated case."""
+
+    def __init__(self):
+        self._requester_id = "U_REQUESTER"
+
+    async def close(self) -> None:
+        return None
+
+    async def _conversation(self, conversation_id: str) -> SlackConversation | None:
+        return SlackConversation(conversation_id, False, False, False, frozenset())
+
+    async def _api(self, method: str, **data):
+        if method == "search.messages":
+            query = data["query"]
+            exact = {
+                "channel": {"id": "C_EXACT", "name": "meter"},
+                "ts": "1710000000.000100",
+            }
+            company_only = {
+                "channel": {"id": "C_COMPANY", "name": "meeting"},
+                "ts": "1710001000.000100",
+            }
+            matches = {
+                "서울도시가스 검침일자": [exact],
+                "검침일자": [exact],
+                "서울도시가스": [exact, company_only],
+                "도시가스 서울도시가스": [company_only],
+            }.get(query, [])
+            return {"ok": True, "messages": {"matches": matches}}
+        if method == "conversations.replies":
+            message = (
+                "서울도시가스 검침일자 변경에 따른 자가검침 예정일자 조정"
+                if data["channel"] == "C_EXACT"
+                else "서울도시가스 계약 전환 및 개발 일정 회의"
+            )
+            return {"ok": True, "messages": [{"ts": data["ts"], "text": message}]}
+        if method == "chat.getPermalink":
+            return {"ok": True, "permalink": f"https://slack.example/{data['channel']}/{data['message_ts']}"}
+        raise AssertionError(f"unexpected API method: {method}")
+
+
 def _case(source_id: str, thread_messages: list[str], *, source_url: str | None = "https://slack.example/source"):
     return SourceRecord(
         provider=Provider.SLACK,
@@ -102,6 +144,16 @@ def test_query_planner_prioritizes_company_feature_and_input_symptom():
 
     assert queries == ["서울도시가스 자가검침", "자가검침 입력", "자가검침", "서울도시가스"]
     assert "도시가스" not in queries
+
+
+def test_named_company_question_requires_company_and_feature_match():
+    question = "서울도시가스에서 검침일자 변경을 해야 된대. 쿼리가 뭐였지?"
+    reader = FocusSlackReader()
+
+    records = asyncio.run(reader.search_cases(question))
+
+    assert slack_minimum_focus_matches(question) == 2
+    assert [record.source_id for record in records] == ["C_EXACT:1710000000.000100"]
 
 
 def test_slack_hits_in_one_thread_become_one_case_and_current_dm_is_excluded():
