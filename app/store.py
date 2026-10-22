@@ -59,6 +59,13 @@ class ConnectionStore:
               event_id TEXT PRIMARY KEY,
               received_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS pending_clarifications (
+              slack_user_id TEXT NOT NULL,
+              channel_id TEXT NOT NULL,
+              encrypted_question BLOB NOT NULL,
+              expires_at INTEGER NOT NULL,
+              PRIMARY KEY (slack_user_id, channel_id)
+            );
             CREATE TABLE IF NOT EXISTS audit_events (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               slack_user_id TEXT NOT NULL,
@@ -190,6 +197,46 @@ class ConnectionStore:
         except sqlite3.IntegrityError:
             return False
 
+    def save_pending_question(
+        self, *, slack_user_id: str, channel_id: str, question: str, expires_at: int
+    ) -> None:
+        """Keep an encrypted clarification prompt briefly, never in audit logs."""
+        encrypted = self._fernet.encrypt(question.encode("utf-8"))
+        self._connection.execute(
+            """
+            INSERT INTO pending_clarifications(slack_user_id, channel_id, encrypted_question, expires_at)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(slack_user_id, channel_id) DO UPDATE SET
+              encrypted_question=excluded.encrypted_question, expires_at=excluded.expires_at
+            """,
+            (slack_user_id, channel_id, encrypted, expires_at),
+        )
+        self._connection.commit()
+
+    def consume_pending_question(self, *, slack_user_id: str, channel_id: str) -> str | None:
+        row = self._connection.execute(
+            """
+            SELECT encrypted_question, expires_at FROM pending_clarifications
+            WHERE slack_user_id=? AND channel_id=?
+            """,
+            (slack_user_id, channel_id),
+        ).fetchone()
+        self._connection.execute(
+            "DELETE FROM pending_clarifications WHERE slack_user_id=? AND channel_id=?",
+            (slack_user_id, channel_id),
+        )
+        self._connection.commit()
+        if row is None or row["expires_at"] < int(time.time()):
+            return None
+        return self._fernet.decrypt(row["encrypted_question"]).decode("utf-8")
+
+    def clear_pending_question(self, *, slack_user_id: str, channel_id: str) -> None:
+        self._connection.execute(
+            "DELETE FROM pending_clarifications WHERE slack_user_id=? AND channel_id=?",
+            (slack_user_id, channel_id),
+        )
+        self._connection.commit()
+
     def audit(
         self,
         *,
@@ -299,6 +346,32 @@ class FirestoreConnectionStore:
             return True
         except Exception:
             return False
+
+    def save_pending_question(self, *, slack_user_id, channel_id, question, expires_at):
+        encrypted = base64.urlsafe_b64encode(self._fernet.encrypt(question.encode())).decode()
+        self._doc("pending_clarifications", f"{slack_user_id}--{channel_id}").set(
+            {"encrypted_question": encrypted, "expires_at": expires_at}
+        )
+
+    def consume_pending_question(self, *, slack_user_id, channel_id):
+        ref = self._doc("pending_clarifications", f"{slack_user_id}--{channel_id}")
+        transaction = self._db.transaction()
+        from google.cloud import firestore
+
+        @firestore.transactional
+        def consume(transaction, ref):
+            snapshot = ref.get(transaction=transaction)
+            transaction.delete(ref)
+            return snapshot.to_dict() if snapshot.exists else None
+
+        data = consume(transaction, ref)
+        if not data or data.get("expires_at", 0) < int(time.time()):
+            return None
+        encrypted = base64.urlsafe_b64decode(data["encrypted_question"])
+        return self._fernet.decrypt(encrypted).decode("utf-8")
+
+    def clear_pending_question(self, *, slack_user_id, channel_id):
+        self._doc("pending_clarifications", f"{slack_user_id}--{channel_id}").delete()
 
     def audit(self, *, slack_user_id, action, provider=None, details=None):
         self._db.collection(f"{self._prefix}_audit_events").add({"slack_user_id": slack_user_id, "action": action,

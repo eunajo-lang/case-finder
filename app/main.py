@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Optional
 
 import httpx
@@ -8,6 +9,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from .config import ConfigurationError, Settings
+from .connectors import interpret_search_intent
 from .models import Provider
 from .oauth import OAuthClient, OAuthError
 from .security import SecurityError, StateSigner, state_digest, verify_slack_signature
@@ -96,12 +98,29 @@ async def handle_question(
         message = _connection_message(settings, store, signer, oauth, slack_user_id, list(Provider))
     else:
         try:
-            outcome = await search.search(
-                slack_user_id=slack_user_id,
-                question=text,
-                exclude_slack_conversation_id=channel_id,
+            pending_question = store.consume_pending_question(
+                slack_user_id=slack_user_id, channel_id=channel_id
             )
-            message = await answer.compose(question=text, outcome=outcome)
+            if pending_question and text.strip().lower() in {"취소", "그만", "cancel", "stop"}:
+                message = "확인 질문을 취소했습니다. 새로 질문해 주세요."
+            else:
+                question = _combine_question(pending_question, text)
+                intent = interpret_search_intent(question)
+                if intent.clarification_prompt:
+                    store.save_pending_question(
+                        slack_user_id=slack_user_id,
+                        channel_id=channel_id,
+                        question=question,
+                        expires_at=int(time.time()) + 600,
+                    )
+                    message = intent.clarification_prompt
+                else:
+                    outcome = await search.search(
+                        slack_user_id=slack_user_id,
+                        question=question,
+                        exclude_slack_conversation_id=channel_id,
+                    )
+                    message = await answer.compose(question=question, outcome=outcome)
         except Exception:
             # Do not include provider error text: it might expose source or configuration details.
             message = "기록을 안전하게 조회하지 못했습니다. 연결 상태를 확인한 뒤 다시 시도해 주세요."
@@ -111,6 +130,13 @@ async def handle_question(
         text=message,
         thread_ts=event.get("thread_ts") or event.get("ts"),
     )
+
+
+def _combine_question(pending_question: str | None, clarification: str) -> str:
+    """Use a one-time DM clarification without losing the original incident."""
+    if not pending_question:
+        return clarification
+    return f"{pending_question}\n추가 설명: {clarification}"
 
 
 def _connection_message(

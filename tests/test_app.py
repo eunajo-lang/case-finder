@@ -1,12 +1,16 @@
 import hashlib
 import hmac
 import time
+import asyncio
 
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
 from app.config import Settings
+from app import main
 from app.main import create_app
+from app.models import Provider
+from app.services import SearchOutcome
 
 
 def settings(tmp_path):
@@ -51,3 +55,64 @@ def test_slack_url_verification_requires_signature(tmp_path):
     assert response.status_code == 200
     assert response.json() == {"challenge": "safe-challenge"}
     assert client.post("/slack/events", content=body).status_code == 401
+
+
+class _ClarificationStore:
+    def __init__(self):
+        self.pending: str | None = None
+
+    def connected_providers(self, _slack_user_id):
+        return {Provider.SLACK}
+
+    def consume_pending_question(self, **_kwargs):
+        result, self.pending = self.pending, None
+        return result
+
+    def save_pending_question(self, *, question, **_kwargs):
+        self.pending = question
+
+
+class _Search:
+    def __init__(self):
+        self.questions: list[str] = []
+
+    async def search(self, *, question, **_kwargs):
+        self.questions.append(question)
+        return SearchOutcome(records=[], unavailable=[])
+
+
+class _Answer:
+    async def compose(self, *, question, outcome):
+        return f"searched: {question}"
+
+
+def test_dm_clarification_is_requested_then_combined_before_search(tmp_path, monkeypatch):
+    store = _ClarificationStore()
+    search = _Search()
+    sent: list[str] = []
+
+    async def post_to_slack(*, text, **_kwargs):
+        sent.append(text)
+
+    monkeypatch.setattr(main, "_post_to_slack", post_to_slack)
+    kwargs = {
+        "settings": settings(tmp_path),
+        "store": store,
+        "signer": None,
+        "oauth": None,
+        "search": search,
+        "answer": _Answer(),
+        "slack_user_id": "U_TEST",
+        "channel_id": "D_TEST",
+        "event": {"ts": "1.0"},
+    }
+
+    asyncio.run(main.handle_question(text="서울도시가스 문제 히스토리 보여줘", **kwargs))
+    assert not search.questions
+    assert "기능이나 현상" in sent[-1]
+
+    asyncio.run(main.handle_question(text="미납요금 확정 전에 노출됐어", **kwargs))
+    assert search.questions == [
+        "서울도시가스 문제 히스토리 보여줘\n추가 설명: 미납요금 확정 전에 노출됐어"
+    ]
+    assert sent[-1].startswith("searched:")

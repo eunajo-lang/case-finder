@@ -3,7 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 
-from app.connectors import SlackReader, slack_focus_terms, slack_minimum_focus_matches, slack_query_variants
+from app.connectors import (
+    SlackReader,
+    interpret_search_intent,
+    slack_focus_terms,
+    slack_minimum_focus_matches,
+    slack_query_variants,
+)
 from app.models import Provider, SlackConversation, SourceRecord
 from app.services import AnswerService, SearchOutcome, redact_sensitive_text
 
@@ -156,6 +162,27 @@ def test_query_planner_prioritizes_incident_words_over_conversational_words():
         "미납 확정",
         "미납 노출",
     ]
+
+
+def test_search_intent_keeps_time_words_as_context_not_search_terms():
+    intent = interpret_search_intent(
+        "서울도시가스에서 이번에 또 미납요금 확정 작업 전에 미납요금이 노출됐대. 히스토리 보여줘"
+    )
+
+    assert intent.subject == "서울도시가스"
+    assert intent.features == ("미납", "확정", "노출")
+    assert intent.request_type == "history"
+    assert intent.time_context == "이번"
+    assert intent.clarification_prompt is None
+
+
+def test_search_intent_asks_for_clarification_when_company_has_no_incident():
+    intent = interpret_search_intent("서울도시가스 문제 히스토리 보여줘")
+
+    assert intent.subject == "서울도시가스"
+    assert not intent.features
+    assert intent.clarification_prompt is not None
+    assert "기능이나 현상" in intent.clarification_prompt
 
 
 def test_named_company_question_requires_company_and_feature_match():

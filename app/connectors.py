@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import re
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
@@ -155,6 +156,74 @@ _QUERY_CONTEXT_TERMS = {
     "히스토리",
     "보여줘",
 }
+
+
+@dataclass(frozen=True)
+class SearchIntent:
+    """The minimum incident context needed before retrieving company records.
+
+    This is deliberately deterministic. A user should not be blocked from a
+    history search merely because an external summarisation model is unavailable.
+    """
+
+    subject: str | None
+    features: tuple[str, ...]
+    request_type: str
+    time_context: str | None
+    clarification_prompt: str | None
+
+
+def interpret_search_intent(question: str) -> SearchIntent:
+    """Extract search intent and ask only when no incident can be identified.
+
+    Conversational time words, for example ``이번``, are retained as context for
+    a later answer but never become evidence-search terms. A company name alone
+    is too broad: it would invite unrelated meetings or announcements into an
+    incident answer.
+    """
+    normalized = re.sub(r"[^0-9A-Za-z가-힣]+", " ", question).strip()
+    tokens = _question_tokens(question)
+    anchor = next((term for term in _SUBJECT_TERMS if term in normalized), None)
+    subject = next(
+        (token for token in tokens if anchor and token != anchor and anchor in token),
+        None,
+    )
+    features = tuple(term for term in _DOMAIN_FEATURE_TERMS if term in normalized)
+    if not features:
+        features = tuple(term for term in _INCIDENT_TERMS if term in normalized)
+
+    if any(marker in normalized for marker in ("쿼리", "sql", "조회식", "where절")):
+        request_type = "lookup"
+    elif any(marker in normalized for marker in ("왜", "원인", "이유")):
+        request_type = "cause"
+    elif any(marker in normalized for marker in ("어떻게 처리", "처리", "대응", "해결")):
+        request_type = "resolution"
+    else:
+        request_type = "history"
+
+    time_context = next(
+        (marker for marker in ("오늘", "어제", "이번", "최근", "지난", "작년", "올해") if marker in normalized),
+        None,
+    )
+    if features:
+        clarification_prompt = None
+    elif subject:
+        clarification_prompt = (
+            "검색할 사건을 조금만 구체적으로 알려주세요. "
+            "예: ‘미납요금 확정 전 노출’, ‘자가검침 입력 불가’처럼 기능이나 현상을 적어 주세요."
+        )
+    else:
+        clarification_prompt = (
+            "정확한 사례를 찾으려면 대상 서비스(또는 회사)와 현상을 알려주세요. "
+            "예: ‘서울도시가스 고객의 미납요금 확정 전 노출’처럼 적어 주세요."
+        )
+    return SearchIntent(
+        subject=subject,
+        features=features,
+        request_type=request_type,
+        time_context=time_context,
+        clarification_prompt=clarification_prompt,
+    )
 
 
 def _question_tokens(question: str) -> list[str]:
